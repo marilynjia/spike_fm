@@ -1,0 +1,20 @@
+# data and training outputs (large, reproducible)
+data/
+*.h5
+outputs/
+checkpoints/
+*.pt
+*.log
+
+# wandb run files (keep the folder's settings file)
+poyo/wandb/*
+!poyo/wandb/settings
+
+# Python / Jupyter / macOS
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+
+# eval outputs and rendered figures (rebuild with poyo/eval.py, baselines/, plotting/)
+results/
+figures/

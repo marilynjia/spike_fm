@@ -1,0 +1,187 @@
+import logging
+from pathlib import Path
+
+import hydra
+import numpy as np
+import pandas as pd
+import torch
+import torchmetrics
+import wandb
+from datasets.wrapper import PoyoDatasetWrapper
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+from utils import (
+    BehaviorStitcher,
+    create_optim,
+    move_to_device,
+    seed_everything,
+    weighted_mse_loss_fn,
+)
+
+from torch_brain.batching import collate
+from torch_brain.models import POYO
+from torch_brain.samplers import (
+    RandomFixedWindowSampler,
+    SequentialFixedWindowSampler,
+)
+
+
+@hydra.main(version_base="1.3", config_path="./configs")
+def main(cfg: DictConfig):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger = logging.getLogger(__name__)
+    run = wandb.init(**cfg.wandb)
+    seed_everything(cfg.seed)
+
+    # Datasets
+    train_ds = instantiate(cfg.dataset, root=cfg.data_root)
+    train_ds.transform = instantiate(cfg.train_transform)
+
+    val_ds = instantiate(cfg.dataset, root=cfg.data_root)
+    val_ds.transform = instantiate(cfg.eval_transform)
+
+    logger.info(
+        f"Dataset: num_recordings={len(train_ds.recording_ids)}, "
+        f"num_units={len(train_ds.get_unit_ids())}"
+    )
+
+    # Model
+    start_epoch = 0
+    if cfg.get("init_from"):
+        # Continue from saved weights; the optimizer and LR schedule start fresh
+        model = POYO.load_pretrained(cfg.init_from)
+        start_epoch = torch.load(cfg.init_from, map_location="cpu", weights_only=False)["epoch"]
+        logger.info(f"Initialized from {cfg.init_from} (epoch {start_epoch})")
+    else:
+        model: POYO = instantiate(cfg.model, dim_out=train_ds.dim_target)
+        model.init_vocabs(train_ds)
+    model = model.to(device)
+    train_ds = PoyoDatasetWrapper(train_ds, model.tokenize)
+    val_ds = PoyoDatasetWrapper(val_ds, model.tokenize)
+
+    # Samplers
+    train_sampler = RandomFixedWindowSampler(
+        sampling_intervals=train_ds.get_sampling_intervals("train"),
+        window_length=model.sequence_length,
+        generator=torch.Generator().manual_seed(cfg.seed + 1),
+    )
+    val_sampler = SequentialFixedWindowSampler(
+        sampling_intervals=val_ds.get_sampling_intervals("valid"),
+        window_length=model.sequence_length,
+        step=model.sequence_length / 2.0,
+    )
+
+    # Loaders
+    train_loader = torch.utils.data.DataLoader(
+        train_ds,
+        sampler=train_sampler,
+        drop_last=True,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        persistent_workers=cfg.num_workers > 0,
+        collate_fn=collate,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds,
+        sampler=val_sampler,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        persistent_workers=cfg.num_workers > 0,
+        collate_fn=collate,
+    )
+
+    # Optimizer
+    optim, scheduler = create_optim(model, len(train_loader), cfg)
+
+    # Train loop
+    step = 0
+    last_epoch = start_epoch + cfg.epochs
+    for epoch in tqdm(range(start_epoch, last_epoch), desc="Epoch"):
+        # Train epoch
+        model.train()
+        loader_pbar = tqdm(train_loader, leave=False)
+        for X, Y in loader_pbar:
+            X, Y = move_to_device((X, Y), device)
+            mask = Y["output_mask"]
+            pred = model(**X, output_timestamps=Y["timestamps"])[mask]
+
+            target = Y["values"][mask]
+            loss_weights = Y["weights"][mask]
+            loss = weighted_mse_loss_fn(pred, target, loss_weights)
+
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+
+            # Logging
+            loader_pbar.set_description(f"Loss: {loss.item():.3f}")
+            run.log(
+                {
+                    "train/loss": loss.item(),
+                    "train/lr": optim.param_groups[0]["lr"],
+                    "train/step": step,
+                    "train/epoch": epoch,
+                }
+            )
+
+            scheduler.step()
+            step += 1
+
+        # Validation epoch
+        model.eval()
+        metric_fn = torchmetrics.functional.r2_score
+        with torch.no_grad():
+            stitchers = {rid: BehaviorStitcher() for rid in val_ds.recording_ids}
+
+            for X, Y in tqdm(val_loader, leave=False):
+                X, Y = move_to_device((X, Y), device)
+                pred = model(**X, output_timestamps=Y["timestamps"])
+
+                for i in range(len(pred)):
+                    _mask = Y["eval_mask"][i]
+                    _rid = Y["session_id"][i]
+                    stitchers[_rid].update(
+                        preds=pred[i][_mask],
+                        targets=Y["values"][i][_mask],
+                        timestamps=Y["timestamps"][i][_mask] + Y["absolute_start"][i],
+                    )
+
+            # Metric computation and logging
+            metrics = {}
+            for rid, stitcher in stitchers.items():
+                pred, target = stitcher.compute()
+                metrics[f"val/{rid}"] = metric_fn(pred, target).item()
+            metrics["val/avg_metric"] = np.mean(list(metrics.values()))
+
+            print(pd.Series(metrics))
+            run.log(
+                {
+                    **metrics,
+                    "train/step": step,
+                    "train/epoch": epoch,
+                }
+            )
+
+        # Checkpoint (loadable with POYO.load_pretrained)
+        if (epoch + 1) % cfg.ckpt_every == 0 or epoch + 1 == last_epoch:
+            ckpt_dir = Path(HydraConfig.get().runtime.output_dir) / "checkpoints"
+            ckpt_dir.mkdir(exist_ok=True)
+            ckpt_path = ckpt_dir / f"epoch_{epoch + 1:03d}.pt"
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "hyper_parameters": {
+                        "model": OmegaConf.to_container(cfg.model, resolve=True)
+                    },
+                    "epoch": epoch + 1,
+                    "val_metric": metrics["val/avg_metric"],
+                },
+                ckpt_path,
+            )
+            logger.info(f"Saved checkpoint to {ckpt_path}")
+
+
+if __name__ == "__main__":
+    main()

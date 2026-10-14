@@ -1,0 +1,19 @@
+defaults:
+  - defaults.yaml
+  - model: poyo_1.3M.yaml
+  - _self_  # ensures current config overrides defaults
+
+data_root: ../data
+epochs: 100
+ckpt_every: 10  # save weights every N epochs (and at the end)
+init_from: null  # checkpoint to continue from; `epochs` then counts additional epochs
+batch_size: 64
+num_workers: 0  # h5 files are kept open, so no worker processes
+
+dataset:
+  _target_: datasets.ibl_bwm.IBLBWMDataset
+  normalize_std: 1.0  # set from add_wheel_targets.py output
+
+wandb:
+  mode: online
+  name: poyo_ibl
