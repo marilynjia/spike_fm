@@ -7,12 +7,17 @@ data_root: ../data
 epochs: 100
 ckpt_every: 10  # save weights every N epochs (and at the end)
 init_from: null  # checkpoint to continue from; `epochs` then counts additional epochs
+
+unit_encoder:
+  enabled: false  # true: unit embeddings from unit_features.py instead of a lookup table
+  hidden_dim: 128
+  waveforms: true  # add waveform features; needs files from convert_sessions.py --aws-root
 batch_size: 64
 num_workers: 0  # h5 files are kept open, so no worker processes
 
 dataset:
-  _target_: datasets.ibl_bwm.IBLBWMDataset
-  normalize_std: 1.0  # set from add_wheel_targets.py output
+  _target_: poyo.datasets.ibl_bwm.IBLBWMDataset
+  normalize_std: 0.855  # set from add_wheel_targets.py output
 
 wandb:
   mode: online

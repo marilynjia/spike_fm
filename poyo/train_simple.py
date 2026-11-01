@@ -7,12 +7,13 @@ import pandas as pd
 import torch
 import torchmetrics
 import wandb
-from datasets.wrapper import PoyoDatasetWrapper
+from poyo.datasets.wrapper import PoyoDatasetWrapper
+from poyo.unit_encoder import UnitFeatureEncoder, load_with_encoder
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
-from utils import (
+from poyo.utils import (
     BehaviorStitcher,
     create_optim,
     move_to_device,
@@ -49,14 +50,30 @@ def main(cfg: DictConfig):
 
     # Model
     start_epoch = 0
+    use_encoder = cfg.unit_encoder.enabled
     if cfg.get("init_from"):
         # Continue from saved weights; the optimizer and LR schedule start fresh
-        model = POYO.load_pretrained(cfg.init_from)
+        if use_encoder:
+            model = load_with_encoder(
+                cfg.model,
+                cfg.init_from,
+                train_ds,
+                cfg.unit_encoder.hidden_dim,
+                cfg.unit_encoder.waveforms,
+            )
+        else:
+            model = POYO.load_pretrained(cfg.init_from)
         start_epoch = torch.load(cfg.init_from, map_location="cpu", weights_only=False)["epoch"]
         logger.info(f"Initialized from {cfg.init_from} (epoch {start_epoch})")
     else:
         model: POYO = instantiate(cfg.model, dim_out=train_ds.dim_target)
         model.init_vocabs(train_ds)
+        if use_encoder:
+            # unit embeddings come from unit features instead of a lookup table
+            model.unit_emb = UnitFeatureEncoder.from_model(
+                model, train_ds, cfg.unit_encoder.hidden_dim, cfg.unit_encoder.waveforms
+            )
+            logger.info("Unit embeddings: UnitFeatureEncoder")
     model = model.to(device)
     train_ds = PoyoDatasetWrapper(train_ds, model.tokenize)
     val_ds = PoyoDatasetWrapper(val_ds, model.tokenize)

@@ -4,11 +4,18 @@ Usage:
     python convert_sessions.py --eid <session id>          # all probes of the session
     python convert_sessions.py --pid <probe insertion id>  # one probe only
 
+    # from the team's AWS export (<dir>/<eid>.h5 + <dir>/units.parquet) instead of ONE;
+    # run from spike_fm/ with PYTHONPATH=.
+    python poyo/datasets/convert_sessions.py --eid <session id> --aws-root <dir>
+
 Output:
     <out-dir>/<eid>.h5, with this structure:
 
     data.spikes   IrregularTimeSeries  timestamps (s), unit_index (row of data.units)
-    data.units    ArrayDict            id, probe, cluster_id, region, atlas_id, label, x, y, z, depth
+    data.units    ArrayDict            id, probe, cluster_id, region, atlas_id, label, x, y, z, depth,
+                                       waveform [--aws-root only]: (n_units, 40, 128) mean
+                                       waveform in volts, 40 channels centred on the peak
+                                       channel x 128 samples at 30 kHz
     data.trials   Interval             start, end, event times, choice, contrasts, block prior
     data.wheel    IrregularTimeSeries  timestamps (s), position (rad)   [optional]
     data.session / data.subject / data.device / data.brainset   metadata
@@ -92,8 +99,11 @@ def load_probe(one, eid, pname, good_only):
 
 def load_trials(one, eid):
     """Load the trials table as a torch_brain Interval (one row per trial)."""
-    trials = one.load_object(eid, "trials", collection="alf")
+    return make_trials(one.load_object(eid, "trials", collection="alf"))
 
+
+def make_trials(trials):
+    """IBL trials table (dict or DataFrame of columns) -> torch_brain Interval."""
     if "intervals" in trials:
         start, end = np.asarray(trials["intervals"], dtype=np.float64).T
     else:  # older table layout
@@ -204,6 +214,61 @@ def convert_session(one, eid, pnames, good_only=True, with_wheel=True):
     )
 
 
+def convert_session_aws(root, eid, good_only=True):
+    """Build the Data object for one session of the AWS export, with waveforms."""
+    from preprocessing.load_session import load_session
+
+    session = load_session(root, eid, apply_ibl_qc=good_only)
+    u = session["units"]
+    if len(u) == 0:
+        raise RuntimeError("No units left after filtering. Try --all-units.")
+
+    units = ArrayDict(
+        id=np.array([f"{p}_{c}" for p, c in zip(u["probe"], u["cluster_id"])], dtype=str),
+        probe=u["probe"].to_numpy(dtype=str),
+        cluster_id=u["cluster_id"].to_numpy(dtype=np.int64),
+        region=u["acronym"].fillna("unknown").to_numpy(dtype=str),
+        atlas_id=u["atlas_id"].to_numpy(dtype=np.int64),
+        label=u["label"].to_numpy(dtype=np.float64),
+        x=u["x"].to_numpy(dtype=np.float64),
+        y=u["y"].to_numpy(dtype=np.float64),
+        z=u["z"].to_numpy(dtype=np.float64),
+        depth=u["depths"].to_numpy(dtype=np.float64),
+        waveform=session["waveforms"].astype(np.float32),
+    )
+
+    order = np.argsort(session["spike_times"], kind="stable")
+    spikes = IrregularTimeSeries(
+        timestamps=session["spike_times"][order],
+        unit_index=session["spike_unit_index"][order].astype(np.int64),
+        domain="auto",
+    )
+
+    t, pos = session["wheel_times"], session["wheel_position"]
+    ok = np.isfinite(t) & np.isfinite(pos)
+    wheel = IrregularTimeSeries(timestamps=t[ok], position=pos[ok], domain="auto")
+
+    attrs = session["attrs"]
+    return Data(
+        brainset=BrainsetDescription(
+            id="ibl_brain_wide_map",
+            origin_version=str(attrs.get("release_freeze", "unknown")),
+            derived_version=str(attrs.get("build_version", "unknown")),
+            source=IBL_PUBLIC_URL,
+            description="IBL Brain-Wide Map: Neuropixels recordings in mice "
+            "during a visual decision-making task.",
+        ),
+        subject=SubjectDescription(id=str(attrs.get("subject", "unknown")), species="MUS_MUSCULUS"),
+        session=SessionDescription(id=eid, recording_date=datetime.fromisoformat(str(attrs["date"]))),
+        device=DeviceDescription(id="+".join(sorted(set(units.probe))), recording_tech="NEUROPIXELS_SPIKES"),
+        domain="auto",
+        spikes=spikes,
+        units=units,
+        trials=make_trials(session["trials"]),
+        wheel=wheel,
+    )
+
+
 def save(data, path):
     """Write the Data object to HDF5."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +291,19 @@ def main():
     parser.add_argument("--all-units", action="store_true",
                         help="keep all sorted units, not only those with label == 1")
     parser.add_argument("--no-wheel", action="store_true", help="do not store the wheel")
+    parser.add_argument("--aws-root", default=None,
+                        help="read <aws-root>/<eid>.h5 + units.parquet instead of ONE (adds waveforms)")
     args = parser.parse_args()
+
+    if args.aws_root:
+        if not args.eid:
+            parser.error("--aws-root needs --eid")
+        data = convert_session_aws(args.aws_root, args.eid, good_only=not args.all_units)
+        path = Path(args.out_dir) / f"{args.eid}.h5"
+        save(data, path)
+        print(f"Saved {path}: {len(data.units.id)} units, "
+              f"{len(data.spikes.timestamps):,} spikes, {len(data.trials.start)} trials")
+        return
 
     one_args = dict(base_url=IBL_PUBLIC_URL, password="international", silent=True)
     if args.cache_dir:

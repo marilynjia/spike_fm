@@ -5,10 +5,11 @@ import random
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from optim import SparseLamb
+from poyo.optim import SparseLamb
 from torch import Tensor
 
 from torch_brain.models import POYO
+from torch_brain.nn import InfiniteVocabEmbedding
 from torch_brain.utils.stitcher import stitch
 
 log = logging.getLogger(__name__)
@@ -70,14 +71,16 @@ class BehaviorStitcher:
 
 
 def create_optim(model: POYO, steps_per_epoch: int, cfg: DictConfig):
-    emb_params = [
-        p for n, p in model.named_parameters() if "unit_emb" in n or "session_emb" in n
-    ]
-    nonemb_params = [
-        p
-        for n, p in model.named_parameters()
-        if "unit_emb" not in n and "session_emb" not in n
-    ]
+    # Only lookup tables get sparse updates; a UnitFeatureEncoder in unit_emb
+    # has dense gradients and goes with the other weights
+    sparse_ids = {
+        id(p)
+        for m in model.modules()
+        if isinstance(m, InfiniteVocabEmbedding)
+        for p in m.parameters()
+    }
+    emb_params = [p for p in model.parameters() if id(p) in sparse_ids]
+    nonemb_params = [p for p in model.parameters() if id(p) not in sparse_ids]
 
     max_lr = cfg.optim.base_lr * cfg.batch_size
     optim = SparseLamb(

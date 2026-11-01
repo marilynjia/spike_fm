@@ -20,11 +20,12 @@ from pathlib import Path
 import numpy as np
 import torch
 import torchmetrics
-from datasets.wrapper import PoyoDatasetWrapper
+from poyo.datasets.wrapper import PoyoDatasetWrapper
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from utils import move_to_device
+from poyo.unit_encoder import load_with_encoder
+from poyo.utils import move_to_device
 
 from torch_brain.batching import collate
 from torch_brain.models import POYO
@@ -82,9 +83,19 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = POYO.load_pretrained(args.checkpoint).to(device).eval()
     base_ds = instantiate(cfg.dataset, root=cfg.data_root)
     base_ds.transform = instantiate(cfg.eval_transform)
+    if cfg.get("unit_encoder") and cfg.unit_encoder.enabled:
+        model = load_with_encoder(
+            cfg.model,
+            args.checkpoint,
+            base_ds,
+            cfg.unit_encoder.hidden_dim,
+            cfg.unit_encoder.get("waveforms", False),
+        )
+    else:
+        model = POYO.load_pretrained(args.checkpoint)
+    model = model.to(device).eval()
     ds = PoyoDatasetWrapper(base_ds, model.tokenize)
 
     metrics = {"checkpoint": str(args.checkpoint)}

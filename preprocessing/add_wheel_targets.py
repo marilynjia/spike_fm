@@ -9,22 +9,16 @@ To each h5, add:
 Whole trials are assigned to splits at random, so every split covers the whole
 session (engaged and disengaged periods alike). A time split would put the
 last, mostly disengaged trials in validation only.
-
-Usage:
-    python add_wheel_targets.py ../data/ibl_bwm/*.h5
 """
 
 import sys
 from pathlib import Path
-
 import h5py
 import numpy as np
-
 from torch_brain.data import Data, Interval, IrregularTimeSeries
 
 SPLIT_FRACTIONS = {"train": 0.7, "valid": 0.1, "test": 0.2}
 SEED = 0
-
 
 def split_trials(trials, seed=SEED):
     """Randomly assign whole trials to splits; return {split: Interval}."""
